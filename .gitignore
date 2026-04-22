@@ -1,0 +1,10 @@
+# Private / internal docs — not for the public repo
+spec/
+**/docs/
+
+# macOS
+.DS_Store
+
+# Future tools
+node_modules/
+dist/
