@@ -15,7 +15,7 @@ load test_helper
   [[ "$row" == *"[alpha]"* ]]
   # No gitBranch in fixture → no branch glyph.
   [[ "$row" != *"⎇"* ]]
-  # Time-ago is no longer rendered in the row — it lives in the preview.
+  # Row shows label/repo/branch only; timing lives in the preview.
   [[ "$row" != *"ago"* ]]
 }
 

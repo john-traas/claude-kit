@@ -94,7 +94,10 @@ decode_cwd() {
 # is the first (or last) value seen along the line stream.
 JQ_SESSION_FIELDS='
   reduce (inputs | try fromjson catch {}) as $l (
-    {title:"", branch:"", version:"", cwd:"", first_ts:"", last_ts:"", first_user:"", last_user:""};
+    {title:"", branch:"", version:"", cwd:"",
+     first_ts:"", last_ts:"",
+     first_user:"", last_user:"",
+     u_count:0, a_count:0};
     (if $l.type == "user" then
        ($l.message.content? // $l.content? // null) as $c
        | if ($c | type) == "array" then
@@ -113,22 +116,53 @@ JQ_SESSION_FIELDS='
     | (if ($ut | length) > 0 then
          (if .first_user == "" then .first_user = $ut else . end) | .last_user = $ut
        else . end)
+    | (if $l.type == "user"      then .u_count += 1 else . end)
+    | (if $l.type == "assistant" then .a_count += 1 else . end)
   )
-  | [.title, .branch, .version, .cwd, .first_ts, .last_ts, .first_user[:200], .last_user[:200]]
+  | .duration_secs = (
+      if .first_ts != "" and .last_ts != "" then
+        (.last_ts  | sub("\\..*Z$"; "Z") | fromdateiso8601? // 0) -
+        (.first_ts | sub("\\..*Z$"; "Z") | fromdateiso8601? // 0)
+      else 0 end)
+  | [.title, .branch, .version, .cwd,
+     .first_ts, .last_ts,
+     .first_user[:200], .last_user[:200],
+     (.u_count|tostring), (.a_count|tostring), (.duration_secs|tostring)]
   | @tsv
 '
 
+# Field order emitted by the jq reducer above; used to name vars on read.
+_SESSION_FIELDS=(title branch version cwd_in first_ts last_ts first_user last_user u_count a_count duration_secs)
+
 # _extract_session_fields <path>: run the one-pass jq and emit the raw
-# 8-field TSV: title \t branch \t version \t cwd \t first_ts \t last_ts
-#              \t first_user \t last_user
+# TSV (see _SESSION_FIELDS for order).
 _extract_session_fields() {
   jq -R -n -r "$JQ_SESSION_FIELDS" < "$1" 2>/dev/null || true
+}
+
+# _read_session_fields <path>: populate vars named in _SESSION_FIELDS
+# from the jq output. Uses tr → one-line-per-field instead of
+# `IFS=$'\t' read`, which would coalesce consecutive empty fields.
+_read_session_fields() {
+  local path="$1" var
+  while IFS= read -r line; do lines+=("$line"); done < <(_extract_session_fields "$path" | tr '\t' '\n')
+  local i=0
+  for var in "${_SESSION_FIELDS[@]}"; do
+    printf -v "$var" '%s' "${lines[i]:-}"
+    i=$((i + 1))
+  done
+  lines=()
+}
+
+# _mtime <path>: portable mtime in seconds since epoch (BSD + GNU).
+_mtime() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
 }
 
 # format_duration <seconds>: short duration string. 5m / 3h 12m / 2d 4h.
 format_duration() {
   local s="$1"
-  if [ "$s" -lt 0 ]; then s=0; fi
+  [ "$s" -lt 0 ] && s=0
   if   [ "$s" -lt 60 ]; then printf '%ds' "$s"
   elif [ "$s" -lt 3600 ]; then printf '%dm' $((s / 60))
   elif [ "$s" -lt 86400 ]; then printf '%dh %dm' $((s / 3600)) $(((s % 3600) / 60))
@@ -145,69 +179,41 @@ _format_epoch() {
     || echo "?"
 }
 
-# sanitize_row <field>: strip control chars so TSV and single-line
-# display aren't broken by embedded tabs/newlines.
-sanitize_row() {
-  printf '%s' "$1" | tr '\t\n\r' '   '
-}
-
 # extract_metadata <absolute-path-to-jsonl>
 # Emits: mtime<TAB>uuid<TAB>cwd<TAB>display_row
 # display_row is the formatted line shown in the fzf picker.
 extract_metadata() {
   local path="$1"
-  local uuid mtime
+  local uuid="${path##*/}"; uuid="${uuid%.jsonl}"
+  local mtime; mtime="$(_mtime "$path")"
 
-  uuid="$(basename "$path" .jsonl)"
-  if mtime=$(stat -f %m "$path" 2>/dev/null); then :; else
-    mtime=$(stat -c %Y "$path" 2>/dev/null || echo 0)
-  fi
-
-  # Parse the 8-field TSV. Can't use `IFS=$'\t' read` here: bash
-  # coalesces consecutive whitespace-IFS delimiters, so empty leading
-  # fields would cause later fields to slide forward. Split on tabs
-  # via tr and read one field per line.
-  local title branch version cwd_in first_ts last_ts first_user last_user
-  {
-    IFS= read -r title
-    IFS= read -r branch
-    IFS= read -r version
-    IFS= read -r cwd_in
-    IFS= read -r first_ts
-    IFS= read -r last_ts
-    IFS= read -r first_user
-    IFS= read -r last_user
-  } < <(_extract_session_fields "$path" | tr '\t' '\n')
+  local title branch version cwd_in first_ts last_ts first_user last_user u_count a_count duration_secs
+  local -a lines=()
+  _read_session_fields "$path"
 
   # cwd: prefer jsonl field, fall back to lossy decode of the parent dir.
-  local cwd
-  if [ -n "$cwd_in" ]; then
-    cwd="$cwd_in"
-  else
-    cwd="$(decode_cwd "$(basename "$(dirname "$path")")")"
+  local cwd="$cwd_in"
+  if [ -z "$cwd" ]; then
+    local parent="${path%/*}"
+    cwd="$(decode_cwd "${parent##*/}")"
   fi
 
   # Row label: custom title, else short UUID prefix.
-  local label
-  if [ -n "$title" ]; then
-    label="$title"
-  else
-    label="${uuid:0:8}"
-  fi
+  local label="${title:-${uuid:0:8}}"
 
-  local repo="" ; [ -n "$cwd" ] && repo="$(basename "$cwd")"
+  local repo=""; [ -n "$cwd" ] && repo="${cwd##*/}"
 
-  # Truncate title to 50 chars so a pathological line can't blow out the
-  # fzf pane width. Branch truncation at 30 for the same reason.
-  local label_short="$label"
-  [ "${#label_short}" -gt 50 ] && label_short="${label_short:0:47}..."
+  # Truncate title/branch so a pathological line can't blow out the
+  # fzf pane width.
+  [ "${#label}" -gt 50 ] && label="${label:0:47}..."
   local branch_short="$branch"
   [ "${#branch_short}" -gt 30 ] && branch_short="${branch_short:0:27}..."
 
-  local row="${CX_C_TITLE}${label_short}${CX_C_RESET}"
+  local row="${CX_C_TITLE}${label}${CX_C_RESET}"
   [ -n "$repo"         ] && row="$row  ${CX_C_REPO}[$repo]${CX_C_RESET}"
   [ -n "$branch_short" ] && row="$row  ${CX_C_BRANCH}⎇ $branch_short${CX_C_RESET}"
-  row="$(sanitize_row "$row")"
+  # Strip control chars so an embedded tab/newline can't break the TSV.
+  row="${row//$'\t'/ }"; row="${row//$'\n'/ }"; row="${row//$'\r'/ }"
 
   printf '%s\t%s\t%s\t%s\n' "$mtime" "$uuid" "$cwd" "$row"
 }
@@ -216,14 +222,7 @@ extract_metadata() {
 # the path doesn't exist (e.g., saved cwd for a session whose project
 # directory the user has since deleted).
 realpath_safe() {
-  local p="$1"
-  if command -v realpath >/dev/null 2>&1; then
-    realpath "$p" 2>/dev/null || printf '%s' "$p"
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$p" 2>/dev/null || printf '%s' "$p"
-  else
-    printf '%s' "$p"
-  fi
+  realpath "$1" 2>/dev/null || printf '%s' "$1"
 }
 
 # filter_cwd <target-cwd>: read TSV on stdin, emit rows whose cwd (field 3)
@@ -247,14 +246,6 @@ find_session_path() {
   find "$CX_PROJECTS_DIR" -maxdepth 2 -type f -name "${uuid}.jsonl" 2>/dev/null | head -1
 }
 
-# count_turns <path> <role>: count of lines where type==role.
-count_turns() {
-  local path="$1" role="$2"
-  jq -R -r --arg role "$role" \
-    'fromjson? | select(.type==$role) | .type' \
-    < "$path" 2>/dev/null | wc -l | tr -d ' '
-}
-
 cmd_preview() {
   local uuid="${1:-}"
   [ -n "$uuid" ] || { echo "preview: missing uuid" >&2; exit 2; }
@@ -266,70 +257,49 @@ cmd_preview() {
   fi
 
   local mtime last_at
-  if mtime=$(stat -f %m "$path" 2>/dev/null); then :; else
-    mtime=$(stat -c %Y "$path" 2>/dev/null || echo 0)
-  fi
+  mtime="$(_mtime "$path")"
   last_at="$(_format_epoch "$mtime")"
 
-  local title branch version cwd_in first_ts last_ts first last
+  local title branch version cwd_in first_ts last_ts first_user last_user u_count a_count duration_secs
+  local first last
+  local -a lines=()
+  _read_session_fields "$path"
+  first="$first_user"; last="$last_user"
+
+  local cwd="$cwd_in"
+  if [ -z "$cwd" ]; then
+    local parent="${path%/*}"
+    cwd="$(decode_cwd "${parent##*/}")"
+  fi
+
+  local repo=""; [ -n "$cwd" ] && repo="${cwd##*/}"
+
+  local started_at=""
+  [ -n "$first_ts" ] && started_at="${first_ts:0:16}" && started_at="${started_at//T/ }"
+  local duration=""
+  [ "${duration_secs:-0}" -gt 0 ] && duration="$(format_duration "$duration_secs")"
+
   {
-    IFS= read -r title
-    IFS= read -r branch
-    IFS= read -r version
-    IFS= read -r cwd_in
-    IFS= read -r first_ts
-    IFS= read -r last_ts
-    IFS= read -r first
-    IFS= read -r last
-  } < <(_extract_session_fields "$path" | tr '\t' '\n')
-
-  local cwd
-  if [ -n "$cwd_in" ]; then cwd="$cwd_in"
-  else cwd="$(decode_cwd "$(basename "$(dirname "$path")")")"
-  fi
-
-  local repo=""; [ -n "$cwd" ] && repo="$(basename "$cwd")"
-  local u_count a_count
-  u_count="$(count_turns "$path" user)"
-  a_count="$(count_turns "$path" assistant)"
-
-  local started_at="" duration=""
-  if [ -n "$first_ts" ]; then
-    started_at="$(printf '%s' "$first_ts" | cut -c1-16 | tr T ' ')"
-  fi
-  if [ -n "$first_ts" ] && [ -n "$last_ts" ]; then
-    local dsec
-    dsec="$(jq -n --arg a "$first_ts" --arg b "$last_ts" '
-      def secs: sub("\\..*Z$"; "Z") | (fromdateiso8601? // 0);
-      ($b | secs) - ($a | secs) | floor
-    ' 2>/dev/null)"
-    if [ -n "$dsec" ] && [ "$dsec" -gt 0 ]; then
-      duration="$(format_duration "$dsec")"
-    fi
-  fi
-
-  local L="$CX_C_LABEL" R="$CX_C_RESET" D="$CX_C_DIM" B="$CX_C_BRANCH" T="$CX_C_TITLE"
-  {
-    [ -n "$title"      ] && printf '%sTitle:%s    %s%s%s\n' "$L" "$R" "$T" "$title" "$R"
+    [ -n "$title"      ] && printf '%sTitle:%s    %s%s%s\n' "$CX_C_LABEL" "$CX_C_RESET" "$CX_C_TITLE" "$title" "$CX_C_RESET"
     if [ -n "$repo"    ]; then
-      printf '%sProject:%s  %s  %s[%s]%s\n' "$L" "$R" "$cwd" "$D" "$repo" "$R"
+      printf '%sProject:%s  %s  %s[%s]%s\n' "$CX_C_LABEL" "$CX_C_RESET" "$cwd" "$CX_C_DIM" "$repo" "$CX_C_RESET"
     else
-      printf '%sProject:%s  %s\n' "$L" "$R" "$cwd"
+      printf '%sProject:%s  %s\n' "$CX_C_LABEL" "$CX_C_RESET" "$cwd"
     fi
-    [ -n "$branch"     ] && printf '%sBranch:%s   %s%s%s\n' "$L" "$R" "$B" "$branch" "$R"
-    printf                      '%sSession:%s  %s%s%s\n' "$L" "$R" "$D" "$uuid" "$R"
-    [ -n "$version"    ] && printf '%sVersion:%s  %s%s%s\n' "$L" "$R" "$D" "$version" "$R"
+    [ -n "$branch"     ] && printf '%sBranch:%s   %s%s%s\n' "$CX_C_LABEL" "$CX_C_RESET" "$CX_C_BRANCH" "$branch" "$CX_C_RESET"
+    printf                      '%sSession:%s  %s%s%s\n' "$CX_C_LABEL" "$CX_C_RESET" "$CX_C_DIM" "$uuid" "$CX_C_RESET"
+    [ -n "$version"    ] && printf '%sVersion:%s  %s%s%s\n' "$CX_C_LABEL" "$CX_C_RESET" "$CX_C_DIM" "$version" "$CX_C_RESET"
     echo
-    [ -n "$started_at" ] && printf '%sStarted:%s  %s\n' "$L" "$R" "$started_at"
-    printf                      '%sLast:%s     %s\n' "$L" "$R" "$last_at"
-    [ -n "$duration"   ] && printf '%sDuration:%s %s\n' "$L" "$R" "$duration"
-    printf                      '%sTurns:%s    %s user / %s assistant\n' "$L" "$R" "$u_count" "$a_count"
+    [ -n "$started_at" ] && printf '%sStarted:%s  %s\n' "$CX_C_LABEL" "$CX_C_RESET" "$started_at"
+    printf                      '%sLast:%s     %s\n' "$CX_C_LABEL" "$CX_C_RESET" "$last_at"
+    [ -n "$duration"   ] && printf '%sDuration:%s %s\n' "$CX_C_LABEL" "$CX_C_RESET" "$duration"
+    printf                      '%sTurns:%s    %s user / %s assistant\n' "$CX_C_LABEL" "$CX_C_RESET" "$u_count" "$a_count"
     echo
-    printf '%sFirst user message:%s\n' "$L" "$R"
-    printf '  %s\n' "$(printf '%s' "$first" | cut -c1-200)"
+    printf '%sFirst user message:%s\n' "$CX_C_LABEL" "$CX_C_RESET"
+    printf '  %s\n' "${first:0:200}"
     echo
-    printf '%sLast user message:%s\n' "$L" "$R"
-    printf '  %s\n' "$(printf '%s' "$last" | cut -c1-200)"
+    printf '%sLast user message:%s\n' "$CX_C_LABEL" "$CX_C_RESET"
+    printf '  %s\n' "${last:0:200}"
   }
 }
 
@@ -340,11 +310,6 @@ cmd_preview() {
 scan_sessions() {
   local self="${CX_LITE_SELF:-$0}"
   discover_sessions | xargs -P 8 -I {} "$self" emit "{}"
-}
-
-# Internal subcommand used by scan_sessions' xargs workers.
-cmd_emit() {
-  extract_metadata "$1"
 }
 
 # cmd_pick: orchestrates discovery → filter → sort → fzf → emit choice.
@@ -458,7 +423,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   case "${1:-pick}" in
     -h|--help) usage ;;
     preview) shift; cmd_preview "$@" ;;
-    emit)    shift; cmd_emit "$@" ;;
+    emit)    shift; extract_metadata "$@" ;;
     resume)  shift; cmd_resume "$@" ;;
     pick)    shift || true; cmd_pick "$@" ;;
     --all|--print-first) cmd_pick "$@" ;;
