@@ -14,9 +14,13 @@ CX_CONFIG="${CX_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claudex-lite/config}"
 : "${CX_ROW_SHOW_REPO:=1}"
 : "${CX_ROW_SHOW_BRANCH:=1}"
 
-# Export so xargs workers and fzf's execute() children inherit the
-# same theme and column choices without re-reading the config file.
-export CX_THEME CX_ROW_SHOW_REPO CX_ROW_SHOW_BRANCH CX_CONFIG CX_PROJECTS_DIR
+# Export path-locating vars so children look at the same dirs. Do NOT
+# export CX_THEME / CX_ROW_SHOW_* — children re-source the config file
+# themselves, which lets a value saved mid-session propagate to the
+# next reload or preview. Shell-inherited env vars stay exported
+# automatically, so a startup-time `CX_THEME=mono` still reaches
+# workers without our help.
+export CX_CONFIG CX_PROJECTS_DIR
 
 usage() {
   cat <<EOF
@@ -492,50 +496,62 @@ cmd_pick() {
   local rows_cmd="$self_q rows"
   [ "$all" -eq 1 ] && rows_cmd="$rows_cmd --all"
 
-  # Tee the stream into a temp file so we can detect the empty-list case
-  # after fzf exits (fzf itself just shows an empty picker). EXIT trap
-  # covers Ctrl-C and any other early termination.
+  # Buffer the scan so we can tell empty vs non-empty before launching
+  # fzf. The empty case gets its own small fzf with an inline hint,
+  # rather than a stderr message the user only sees after exit.
   local tmpf; tmpf="$(mktemp)"
-  # Expand $tmpf now (double quotes), not at EXIT time when the local
-  # var is out of scope and would trip `set -u`.
   trap "rm -f '$tmpf'" EXIT
-  local selected
-  selected="$(
-    _pipeline \
-      | tee "$tmpf" \
-      | fzf \
-          --ansi \
-          --exact \
-          --delimiter $'\t' \
-          --with-nth=4 \
-          --preview="$preview_cmd" \
-          --preview-window=right:60% \
-          --bind="ctrl-a:execute($scope_cmd)+abort" \
-          --bind="ctrl-t:execute($configure_cmd)+reload($rows_cmd)" \
-          --header='Enter: resume  |  Ctrl-A: all sessions  |  Ctrl-T: configure  |  Esc: cancel' \
-          || true
-  )"
+  _pipeline > "$tmpf"
 
-  local was_empty=0
-  [ -s "$tmpf" ] || was_empty=1
-  rm -f "$tmpf"
-
-  if [ "$was_empty" -eq 1 ]; then
-    _empty_msg "$all" "$target" >&2
+  if [ ! -s "$tmpf" ]; then
+    _empty_hint "$all" "$target" | fzf \
+      --ansi --no-sort --height=10 \
+      --bind="ctrl-a:execute($scope_cmd)+abort" \
+      --bind="ctrl-t:execute($configure_cmd)+abort" \
+      --bind='enter:abort' \
+      --header='Ctrl-A: all sessions  |  Ctrl-T: configure  |  Esc: cancel' \
+      || true
     return 0
   fi
+
+  local selected
+  selected="$(
+    cat "$tmpf" | fzf \
+        --ansi \
+        --exact \
+        --delimiter $'\t' \
+        --with-nth=4 \
+        --preview="$preview_cmd" \
+        --preview-window=right:60% \
+        --bind="ctrl-a:execute($scope_cmd)+abort" \
+        --bind="ctrl-t:execute($configure_cmd)+reload($rows_cmd)" \
+        --header='Enter: resume  |  Ctrl-A: all sessions  |  Ctrl-T: configure  |  Esc: cancel' \
+        || true
+  )"
+
   [ -n "$selected" ] || return 0
 
-  IFS=$'\t' read -r _ uuid cwd _ <<< "$selected"
+  IFS=$'\t' read -r _ uuid cwd _ _ <<< "$selected"
   cmd_resume "$uuid" "$cwd"
 }
 
+# _empty_msg: short stderr line for --print-first / non-interactive use.
 _empty_msg() {
   local all="$1" target="$2"
   if [ "$all" -eq 0 ]; then
     echo "claudex-lite: no sessions in $target. Try --all to see all sessions."
   else
     echo "claudex-lite: no Claude sessions found. Have you used Claude Code yet?"
+  fi
+}
+
+# _empty_hint: single-line message shown inside fzf when the list is empty.
+_empty_hint() {
+  local all="$1" target="$2"
+  if [ "$all" -eq 0 ]; then
+    printf '⚠ No sessions in %s — press Ctrl-A for all sessions\n' "$target"
+  else
+    printf '⚠ No Claude sessions found — have you used Claude Code yet?\n'
   fi
 }
 
