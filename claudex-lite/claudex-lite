@@ -1,0 +1,590 @@
+#!/usr/bin/env bash
+# claudex-lite — fzf-based Claude Code session picker
+set -euo pipefail
+
+CX_PROJECTS_DIR="${CX_PROJECTS_DIR:-$HOME/.claude/projects}"
+CX_CONFIG="${CX_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claudex-lite/config}"
+
+# Config-file lines use `: "${VAR:=value}"`, so values set in the
+# environment win over anything persisted on disk.
+[ -f "$CX_CONFIG" ] && . "$CX_CONFIG"
+
+# Defaults for anything still unset after env + config.
+: "${CX_THEME:=default}"
+: "${CX_ROW_SHOW_REPO:=1}"
+: "${CX_ROW_SHOW_BRANCH:=1}"
+
+# Export path-locating vars so children look at the same dirs. Do NOT
+# export CX_THEME / CX_ROW_SHOW_* — children re-source the config file
+# themselves, which lets a value saved mid-session propagate to the
+# next reload or preview. Shell-inherited env vars stay exported
+# automatically, so a startup-time `CX_THEME=mono` still reaches
+# workers without our help.
+export CX_CONFIG CX_PROJECTS_DIR
+
+usage() {
+  cat <<EOF
+Usage: claudex-lite [--all]
+       claudex-lite preview <uuid|path> [<mtime>]
+       claudex-lite resume <uuid> <cwd>
+       claudex-lite configure
+
+Pick a Claude Code session from the current directory (or all directories
+with --all) and resume it. Requires: fzf, jq.
+
+Environment:
+  CX_THEME              default | vivid | mono     (default: default)
+  CX_ROW_SHOW_REPO      1 | 0 — show the [repo] column in rows
+  CX_ROW_SHOW_BRANCH    1 | 0 — show the ⎇ branch column in rows
+  CX_CONFIG             path to persisted config (default: XDG)
+  NO_COLOR              if set, forces the mono theme
+EOF
+}
+
+# _apply_theme: sets CX_C_* ANSI variables for the row and preview.
+# Chosen by CX_THEME (env), with NO_COLOR overriding to mono.
+_apply_theme() {
+  local theme="${CX_THEME:-default}"
+  [ -n "${NO_COLOR:-}" ] && theme="mono"
+  case "$theme" in
+    vivid)
+      CX_C_TIME=$'\033[36m'      # cyan
+      CX_C_TITLE=$'\033[1;33m'   # bold yellow
+      CX_C_REPO=$'\033[35m'      # magenta
+      CX_C_BRANCH=$'\033[32m'    # green
+      CX_C_LABEL=$'\033[1;36m'   # bold cyan (preview field labels)
+      CX_C_DIM=$'\033[90m'       # dim
+      CX_C_RESET=$'\033[0m'
+      ;;
+    mono)
+      CX_C_TIME=""; CX_C_TITLE=""; CX_C_REPO=""; CX_C_BRANCH=""
+      CX_C_LABEL=""; CX_C_DIM=""; CX_C_RESET=""
+      ;;
+    default|*)
+      CX_C_TIME=$'\033[90m'      # dim
+      CX_C_TITLE=$'\033[1m'      # bold
+      CX_C_REPO=$'\033[90m'      # dim
+      CX_C_BRANCH=$'\033[32m'    # green
+      CX_C_LABEL=$'\033[1m'      # bold (preview field labels)
+      CX_C_DIM=$'\033[90m'       # dim
+      CX_C_RESET=$'\033[0m'
+      ;;
+  esac
+}
+_apply_theme
+
+# check_deps <dep...>: exit 1 with an install hint if any dep is missing.
+check_deps() {
+  local missing=0
+  for dep in "$@"; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+      echo "claudex-lite: missing required tool: $dep" >&2
+      case "$dep" in
+        fzf) echo "  install: brew install fzf" >&2 ;;
+        jq)  echo "  install: brew install jq"  >&2 ;;
+      esac
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ] || exit 1
+}
+
+# discover_sessions: emit one absolute jsonl path per line.
+# Reads from $CX_PROJECTS_DIR. Safe if dir missing or empty.
+discover_sessions() {
+  [ -d "$CX_PROJECTS_DIR" ] || return 0
+  find "$CX_PROJECTS_DIR" -maxdepth 2 -type f -name '*.jsonl' 2>/dev/null
+}
+
+# decode_cwd: inverse of Claude's encoding. Used only as a fallback —
+# the encoding maps both `/` and `.` to `-`, so decoding is ambiguous
+# for any real path component that contains a dash or dot (e.g.
+# `lime-toolkit` → `lime/toolkit`). Per spec §4.4, prefer the jsonl
+# `cwd` field when present; see extract_cwd.
+decode_cwd() {
+  local encoded="$1"
+  printf '/%s' "${encoded#-}" | tr '-' '/'
+}
+
+# JQ_SESSION_FIELDS: one-pass reducer that walks a jsonl file and emits
+# a TSV line: title \t branch \t version \t cwd \t first_ts \t last_ts
+#            \t first_user_text \t last_user_text
+#
+# Handles both Claude's real shape (.message.content is an array of
+# typed items) and the simplified fixture shape (.content is a string).
+# Invalid lines are tolerated via `try fromjson catch {}`. Each field
+# is the first (or last) value seen along the line stream.
+JQ_SESSION_FIELDS='
+  reduce (inputs | try fromjson catch {}) as $l (
+    {title:"", branch:"", version:"", cwd:"",
+     first_ts:"", last_ts:"",
+     first_user:"", last_user:"",
+     u_count:0, a_count:0};
+    (if $l.type == "user" then
+       ($l.message.content? // $l.content? // null) as $c
+       | if ($c | type) == "array" then
+           [$c[]? | select(.type? == "text") | .text?] | join(" ")
+         elif ($c | type) == "string" then $c
+         else "" end
+     else "" end) as $ut
+    | (if $l.type == "custom-title" and .title == "" then .title = ($l.customTitle // "") else . end)
+    | (if $l.type == "agent-name" and .title == "" then .title = ($l.agentName // "") else . end)
+    | (if ($l.gitBranch // "") != "" and .branch == "" then .branch = $l.gitBranch else . end)
+    | (if ($l.version // "") != "" and .version == "" then .version = $l.version else . end)
+    | (if ($l.cwd // "") != "" and .cwd == "" then .cwd = $l.cwd else . end)
+    | (if ($l.timestamp // "") != "" then
+         (if .first_ts == "" then .first_ts = $l.timestamp else . end) | .last_ts = $l.timestamp
+       else . end)
+    | (if ($ut | length) > 0 then
+         (if .first_user == "" then .first_user = $ut else . end) | .last_user = $ut
+       else . end)
+    | (if $l.type == "user"      then .u_count += 1 else . end)
+    | (if $l.type == "assistant" then .a_count += 1 else . end)
+  )
+  | .duration_secs = (
+      if .first_ts != "" and .last_ts != "" then
+        (.last_ts  | sub("\\..*Z$"; "Z") | fromdateiso8601? // 0) -
+        (.first_ts | sub("\\..*Z$"; "Z") | fromdateiso8601? // 0)
+      else 0 end)
+  | [.title, .branch, .version, .cwd,
+     .first_ts, .last_ts,
+     .first_user[:200], .last_user[:200],
+     (.u_count|tostring), (.a_count|tostring), (.duration_secs|tostring)]
+  | @tsv
+'
+
+# Field order emitted by the jq reducer above; used to name vars on read.
+_SESSION_FIELDS=(title branch version cwd_in first_ts last_ts first_user last_user u_count a_count duration_secs)
+
+# _extract_session_fields <path>: run the one-pass jq and emit the raw
+# TSV (see _SESSION_FIELDS for order).
+_extract_session_fields() {
+  jq -R -n -r "$JQ_SESSION_FIELDS" < "$1" 2>/dev/null || true
+}
+
+# _read_session_fields <path>: populate vars named in _SESSION_FIELDS
+# from the jq output. Uses tr → one-line-per-field instead of
+# `IFS=$'\t' read`, which would coalesce consecutive empty fields.
+_read_session_fields() {
+  local path="$1" var line i=0
+  local -a _lines=()
+  while IFS= read -r line; do _lines+=("$line"); done \
+    < <(_extract_session_fields "$path" | tr '\t' '\n')
+  for var in "${_SESSION_FIELDS[@]}"; do
+    printf -v "$var" '%s' "${_lines[i]:-}"
+    i=$((i + 1))
+  done
+}
+
+# _mtime <path>: portable mtime in seconds since epoch (BSD + GNU).
+_mtime() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+}
+
+# _assemble_row <label> <repo> <branch>: format a picker row using the
+# current theme and CX_ROW_SHOW_* toggles. Shared by extract_metadata
+# (real rows) and cmd_example_row (configure preview).
+_assemble_row() {
+  local label="$1" repo="$2" branch="$3"
+  local row="${CX_C_TITLE}${label}${CX_C_RESET}"
+  [ -n "$repo"   ] && [ "${CX_ROW_SHOW_REPO:-1}"   = "1" ] \
+    && row="$row  ${CX_C_REPO}[$repo]${CX_C_RESET}"
+  [ -n "$branch" ] && [ "${CX_ROW_SHOW_BRANCH:-1}" = "1" ] \
+    && row="$row  ${CX_C_BRANCH}⎇ $branch${CX_C_RESET}"
+  printf '%s' "$row"
+}
+
+# cmd_example_row: render a demo row for the configure menu's preview.
+cmd_example_row() {
+  printf '%sExample row%s — updates as you change settings\n\n  ' \
+    "$CX_C_LABEL" "$CX_C_RESET"
+  _assemble_row "lime-toolkit roadmap" "lime-toolkit" "main"
+  echo
+  echo
+  printf '  Theme:   %s%s%s\n' "$CX_C_TITLE" "$CX_THEME" "$CX_C_RESET"
+  printf '  Repo:    %s\n' "$(_yn "$CX_ROW_SHOW_REPO")"
+  printf '  Branch:  %s\n' "$(_yn "$CX_ROW_SHOW_BRANCH")"
+}
+
+# _resolve_cwd_repo <path> <cwd_from_jsonl>: set caller locals `cwd`
+# and `repo`. Prefers the jsonl value, falls back to the lossy decode.
+_resolve_cwd_repo() {
+  local path="$1" cwd_in_val="$2"
+  if [ -n "$cwd_in_val" ]; then
+    cwd="$cwd_in_val"
+  else
+    local parent="${path%/*}"
+    cwd="$(decode_cwd "${parent##*/}")"
+  fi
+  repo=""
+  [ -n "$cwd" ] && repo="${cwd##*/}"
+}
+
+# format_duration <seconds>: short duration string. 5m / 3h 12m / 2d 4h.
+format_duration() {
+  local s="$1"
+  [ "$s" -lt 0 ] && s=0
+  if   [ "$s" -lt 60 ]; then printf '%ds' "$s"
+  elif [ "$s" -lt 3600 ]; then printf '%dm' $((s / 60))
+  elif [ "$s" -lt 86400 ]; then printf '%dh %dm' $((s / 3600)) $(((s % 3600) / 60))
+  else printf '%dd %dh' $((s / 86400)) $(((s % 86400) / 3600))
+  fi
+}
+
+# _format_epoch <unix-seconds>: portable date formatter. BSD `date -r`
+# takes seconds-since-epoch; GNU `date` wants `-d @<epoch>`.
+_format_epoch() {
+  local ts="$1"
+  date -r "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null \
+    || date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null \
+    || echo "?"
+}
+
+# extract_metadata <absolute-path-to-jsonl>
+# Emits one TSV row: mtime<TAB>uuid<TAB>cwd<TAB>display_row<TAB>path
+# display_row is the label rendered in the fzf list; the trailing path
+# field lets cmd_preview skip a directory walk on each keystroke.
+extract_metadata() {
+  local path="$1"
+  local uuid="${path##*/}"; uuid="${uuid%.jsonl}"
+  local mtime; mtime="$(_mtime "$path")"
+
+  local title branch version cwd_in first_ts last_ts first_user last_user u_count a_count duration_secs
+  _read_session_fields "$path"
+
+  local cwd repo
+  _resolve_cwd_repo "$path" "$cwd_in"
+
+  # Row label: custom title, else short UUID prefix.
+  local label="${title:-${uuid:0:8}}"
+
+  # Truncate title/branch so a pathological line can't blow out the
+  # fzf pane width.
+  [ "${#label}" -gt 50 ] && label="${label:0:47}..."
+  local branch_short="$branch"
+  [ "${#branch_short}" -gt 30 ] && branch_short="${branch_short:0:27}..."
+
+  local row; row="$(_assemble_row "$label" "$repo" "$branch_short")"
+  # Strip control chars so an embedded tab/newline can't break the TSV.
+  row="${row//$'\t'/ }"; row="${row//$'\n'/ }"; row="${row//$'\r'/ }"
+
+  # Field 5 (path) lets cmd_preview skip find_session_path + _mtime
+  # entirely when invoked via fzf's --preview.
+  printf '%s\t%s\t%s\t%s\t%s\n' "$mtime" "$uuid" "$cwd" "$row" "$path"
+}
+
+# realpath_safe <path>: best-effort realpath. Falls back to input when
+# the path doesn't exist (e.g., saved cwd for a session whose project
+# directory the user has since deleted).
+realpath_safe() {
+  realpath "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+# filter_cwd <target-cwd>: read TSV on stdin, emit rows whose cwd (field 3)
+# equals target-cwd after realpath normalization on the target side.
+# Rows are compared literally against the normalized target (awk is cheap;
+# per-row realpath is not).
+filter_cwd() {
+  local target; target="$(realpath_safe "$1")"
+  awk -F'\t' -v target="$target" '$3 == target { print }'
+}
+
+# sort_by_mtime: read TSV on stdin, emit rows sorted by mtime (field 1)
+# descending. Tab-delimited, numeric-reverse.
+sort_by_mtime() {
+  sort -t $'\t' -k1,1nr
+}
+
+# find_session_path <uuid>: absolute path to the .jsonl, or empty if missing.
+find_session_path() {
+  local uuid="$1"
+  find "$CX_PROJECTS_DIR" -maxdepth 2 -type f -name "${uuid}.jsonl" 2>/dev/null | head -1
+}
+
+# cmd_preview <uuid|abs-path> [<mtime>]: render the rich detail panel.
+# Accepts either a bare uuid (tests, shell) or an absolute jsonl path
+# (fzf --preview, which can pass it via TSV column 5). When invoked
+# with mtime, avoids a stat fork.
+cmd_preview() {
+  local arg="${1:-}"
+  [ -n "$arg" ] || { echo "preview: missing uuid or path" >&2; exit 2; }
+
+  # Accept either an absolute path (fzf preview, TSV col 5) or a uuid
+  # (tests, shell invocation).
+  local path uuid
+  if [ "${arg:0:1}" = "/" ]; then
+    path="$arg"
+  else
+    path="$(find_session_path "$arg")"
+    if [ -z "$path" ]; then
+      echo "preview: session $arg not found" >&2
+      exit 1
+    fi
+  fi
+  uuid="${path##*/}"; uuid="${uuid%.jsonl}"
+
+  local mtime="${2:-}"
+  [ -n "$mtime" ] || mtime="$(_mtime "$path")"
+  local last_at; last_at="$(_format_epoch "$mtime")"
+
+  local title branch version cwd_in first_ts last_ts first_user last_user u_count a_count duration_secs
+  _read_session_fields "$path"
+  local first="$first_user" last="$last_user"
+
+  local cwd repo
+  _resolve_cwd_repo "$path" "$cwd_in"
+
+  local started_at=""
+  [ -n "$first_ts" ] && started_at="${first_ts:0:16}" && started_at="${started_at//T/ }"
+  local duration=""
+  [ "${duration_secs:-0}" -gt 0 ] && duration="$(format_duration "$duration_secs")"
+
+  {
+    [ -n "$title"      ] && printf '%sTitle:%s    %s%s%s\n' "$CX_C_LABEL" "$CX_C_RESET" "$CX_C_TITLE" "$title" "$CX_C_RESET"
+    if [ -n "$repo"    ]; then
+      printf '%sProject:%s  %s  %s[%s]%s\n' "$CX_C_LABEL" "$CX_C_RESET" "$cwd" "$CX_C_DIM" "$repo" "$CX_C_RESET"
+    else
+      printf '%sProject:%s  %s\n' "$CX_C_LABEL" "$CX_C_RESET" "$cwd"
+    fi
+    [ -n "$branch"     ] && printf '%sBranch:%s   %s%s%s\n' "$CX_C_LABEL" "$CX_C_RESET" "$CX_C_BRANCH" "$branch" "$CX_C_RESET"
+    printf                      '%sSession:%s  %s%s%s\n' "$CX_C_LABEL" "$CX_C_RESET" "$CX_C_DIM" "$uuid" "$CX_C_RESET"
+    [ -n "$version"    ] && printf '%sVersion:%s  %s%s%s\n' "$CX_C_LABEL" "$CX_C_RESET" "$CX_C_DIM" "$version" "$CX_C_RESET"
+    echo
+    [ -n "$started_at" ] && printf '%sStarted:%s  %s\n' "$CX_C_LABEL" "$CX_C_RESET" "$started_at"
+    printf                      '%sLast:%s     %s\n' "$CX_C_LABEL" "$CX_C_RESET" "$last_at"
+    [ -n "$duration"   ] && printf '%sDuration:%s %s\n' "$CX_C_LABEL" "$CX_C_RESET" "$duration"
+    printf                      '%sTurns:%s    %s user / %s assistant\n' "$CX_C_LABEL" "$CX_C_RESET" "$u_count" "$a_count"
+    echo
+    printf '%sFirst user message:%s\n' "$CX_C_LABEL" "$CX_C_RESET"
+    printf '  %s\n' "${first:0:200}"
+    echo
+    printf '%sLast user message:%s\n' "$CX_C_LABEL" "$CX_C_RESET"
+    printf '  %s\n' "${last:0:200}"
+  }
+}
+
+# scan_sessions: discover + parallel extract_metadata. Emits TSV rows.
+# Re-invokes the script in `emit` mode per session so each xargs worker
+# is a thin shot instead of sourcing the library. CX_LITE_SELF lets tests
+# point at the right script when running under bats (where $0 == bash).
+scan_sessions() {
+  local self="${CX_LITE_SELF:-$0}"
+  discover_sessions | xargs -P 8 -I {} "$self" emit "{}"
+}
+
+# cmd_rows [--all]: emit the full pipeline (scan → optional cwd filter →
+# sort). Kept as its own subcommand so fzf's --bind=reload() has a
+# command to re-invoke after `configure`.
+cmd_rows() {
+  local all=0
+  [ "${1:-}" = "--all" ] && all=1
+  if [ "$all" -eq 1 ]; then
+    scan_sessions | sort_by_mtime
+  else
+    scan_sessions | filter_cwd "$(pwd -P)" | sort_by_mtime
+  fi
+}
+
+_yn() { [ "${1:-0}" = "1" ] && printf 'on' || printf 'off'; }
+
+_save_config() {
+  mkdir -p "$(dirname "$CX_CONFIG")"
+  cat > "$CX_CONFIG" <<EOF
+# Written by claudex-lite configure. The \${VAR:=value} form means an
+# environment override (e.g. NO_COLOR, CX_THEME) still wins over disk.
+: "\${CX_THEME:=$CX_THEME}"
+: "\${CX_ROW_SHOW_REPO:=$CX_ROW_SHOW_REPO}"
+: "\${CX_ROW_SHOW_BRANCH:=$CX_ROW_SHOW_BRANCH}"
+EOF
+}
+
+# cmd_configure: small fzf-driven menu to cycle the theme and toggle
+# the [repo] / ⎇ branch columns, persisting the choice to $CX_CONFIG.
+cmd_configure() {
+  check_deps fzf
+
+  local self="${CX_LITE_SELF:-$0}" self_q
+  printf -v self_q '%q' "$self"
+
+  while :; do
+    local choice
+    choice="$(
+      printf 'Theme: %s\nShow [repo] column: %s\nShow ⎇ branch column: %s\n[Save & exit]\n[Cancel]\n' \
+        "$CX_THEME" "$(_yn "$CX_ROW_SHOW_REPO")" "$(_yn "$CX_ROW_SHOW_BRANCH")" \
+      | fzf --prompt='claudex-lite configure > ' \
+            --ansi --no-sort --height=20 \
+            --preview="$self_q example-row" \
+            --preview-window=top:7 \
+            --header='Enter to change / save / cancel  |  Esc to abandon'
+    )" || return 0
+
+    case "$choice" in
+      Theme:*)
+        case "$CX_THEME" in
+          default) CX_THEME=vivid   ;;
+          vivid)   CX_THEME=mono    ;;
+          *)       CX_THEME=default ;;
+        esac
+        _apply_theme
+        ;;
+      'Show [repo] column:'*)
+        CX_ROW_SHOW_REPO=$((1 - ${CX_ROW_SHOW_REPO:-1}))
+        ;;
+      'Show ⎇ branch column:'*)
+        CX_ROW_SHOW_BRANCH=$((1 - ${CX_ROW_SHOW_BRANCH:-1}))
+        ;;
+      '[Save & exit]')
+        _save_config
+        printf 'claudex-lite: saved %s\n' "$CX_CONFIG" >&2
+        return 0
+        ;;
+      '[Cancel]'|'')
+        return 0
+        ;;
+    esac
+  done
+}
+
+# cmd_pick: orchestrates discovery → filter → sort → fzf → emit choice.
+# Flags:
+#   --all           broaden to all sessions (not just cwd)
+#   --print-first   testing: print first row (bypass fzf), no launch
+cmd_pick() {
+  check_deps fzf jq
+
+  local all=0 print_first=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) all=1; shift ;;
+      --print-first) print_first=1; shift ;;
+      *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  local target; target="$(pwd -P)"
+
+  # Run the pipeline as a function so fzf can start rendering as soon as
+  # the first row is produced, instead of waiting for the whole scan.
+  _pipeline() {
+    if [ "$all" -eq 1 ]; then
+      scan_sessions | sort_by_mtime
+    else
+      scan_sessions | filter_cwd "$target" | sort_by_mtime
+    fi
+  }
+
+  if [ "$print_first" -eq 1 ]; then
+    local first; first="$(_pipeline | head -1)"
+    if [ -z "$first" ]; then
+      _empty_msg "$all" "$target" >&2
+      return 0
+    fi
+    IFS=$'\t' read -r _ uuid cwd _ <<< "$first"
+    printf '%s\t%s\n' "$uuid" "$cwd"
+    return 0
+  fi
+
+  # Shell-quote the self-path so paths containing spaces or shell metas
+  # survive interpolation into fzf's execute() binding.
+  local self="${CX_LITE_SELF:-$0}" self_q
+  printf -v self_q '%q' "$self"
+  # Pass {5}=path and {1}=mtime straight through so cmd_preview can skip
+  # the per-keystroke find+stat it would otherwise do.
+  local preview_cmd="$self_q preview {5} {1}"
+  local scope_cmd="$self_q --all"
+  local configure_cmd="$self_q configure"
+  local rows_cmd="$self_q rows"
+  [ "$all" -eq 1 ] && rows_cmd="$rows_cmd --all"
+
+  # Buffer the scan so we can tell empty vs non-empty before launching
+  # fzf. The empty case gets its own small fzf with an inline hint,
+  # rather than a stderr message the user only sees after exit.
+  local tmpf; tmpf="$(mktemp)"
+  trap "rm -f '$tmpf'" EXIT
+  _pipeline > "$tmpf"
+
+  if [ ! -s "$tmpf" ]; then
+    _empty_hint "$all" "$target" | fzf \
+      --ansi --no-sort --height=10 \
+      --bind="ctrl-a:execute($scope_cmd)+abort" \
+      --bind="ctrl-t:execute($configure_cmd)+abort" \
+      --bind='enter:abort' \
+      --header='Ctrl-A: all sessions  |  Ctrl-T: configure  |  Esc: cancel' \
+      || true
+    return 0
+  fi
+
+  local selected
+  selected="$(
+    cat "$tmpf" | fzf \
+        --ansi \
+        --exact \
+        --delimiter $'\t' \
+        --with-nth=4 \
+        --preview="$preview_cmd" \
+        --preview-window=right:60% \
+        --bind="ctrl-a:execute($scope_cmd)+abort" \
+        --bind="ctrl-t:execute($configure_cmd)+reload($rows_cmd)" \
+        --header='Enter: resume  |  Ctrl-A: all sessions  |  Ctrl-T: configure  |  Esc: cancel' \
+        || true
+  )"
+
+  [ -n "$selected" ] || return 0
+
+  IFS=$'\t' read -r _ uuid cwd _ _ <<< "$selected"
+  cmd_resume "$uuid" "$cwd"
+}
+
+# _empty_msg: short stderr line for --print-first / non-interactive use.
+_empty_msg() {
+  local all="$1" target="$2"
+  if [ "$all" -eq 0 ]; then
+    echo "claudex-lite: no sessions in $target. Try --all to see all sessions."
+  else
+    echo "claudex-lite: no Claude sessions found. Have you used Claude Code yet?"
+  fi
+}
+
+# _empty_hint: single-line message shown inside fzf when the list is empty.
+_empty_hint() {
+  local all="$1" target="$2"
+  if [ "$all" -eq 0 ]; then
+    printf '⚠ No Claude sessions found in this folder — press Ctrl-A for all sessions\n'
+  else
+    printf '⚠ No Claude sessions found anywhere — have you used Claude Code yet?\n'
+  fi
+}
+
+# cmd_resume <uuid> <cwd>: cd to cwd, exec claude --resume.
+cmd_resume() {
+  local uuid="${1:?uuid required}"
+  local cwd="${2:?cwd required}"
+
+  if [ ! -d "$cwd" ]; then
+    echo "claudex-lite: saved cwd no longer exists: $cwd" >&2
+    exit 1
+  fi
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "claudex-lite: 'claude' not on PATH. Install Claude Code: https://claude.com/claude-code" >&2
+    exit 1
+  fi
+
+  cd "$cwd"
+  exec claude --resume "$uuid"
+}
+
+# Only run dispatch when executed directly, not when sourced.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  case "${1:-pick}" in
+    -h|--help) usage ;;
+    preview)   shift; cmd_preview "$@" ;;
+    emit)      shift; extract_metadata "$@" ;;
+    resume)    shift; cmd_resume "$@" ;;
+    configure)   shift; cmd_configure "$@" ;;
+    rows)        shift; cmd_rows "$@" ;;
+    example-row) shift; cmd_example_row "$@" ;;
+    pick)      shift || true; cmd_pick "$@" ;;
+    --all|--print-first) cmd_pick "$@" ;;
+    *) echo "claudex-lite: unknown command '$1'" >&2; usage >&2; exit 2 ;;
+  esac
+fi
