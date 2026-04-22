@@ -144,14 +144,14 @@ _extract_session_fields() {
 # from the jq output. Uses tr → one-line-per-field instead of
 # `IFS=$'\t' read`, which would coalesce consecutive empty fields.
 _read_session_fields() {
-  local path="$1" var
-  while IFS= read -r line; do lines+=("$line"); done < <(_extract_session_fields "$path" | tr '\t' '\n')
-  local i=0
+  local path="$1" var line i=0
+  local -a _lines=()
+  while IFS= read -r line; do _lines+=("$line"); done \
+    < <(_extract_session_fields "$path" | tr '\t' '\n')
   for var in "${_SESSION_FIELDS[@]}"; do
-    printf -v "$var" '%s' "${lines[i]:-}"
+    printf -v "$var" '%s' "${_lines[i]:-}"
     i=$((i + 1))
   done
-  lines=()
 }
 
 # _mtime <path>: portable mtime in seconds since epoch (BSD + GNU).
@@ -188,7 +188,6 @@ extract_metadata() {
   local mtime; mtime="$(_mtime "$path")"
 
   local title branch version cwd_in first_ts last_ts first_user last_user u_count a_count duration_secs
-  local -a lines=()
   _read_session_fields "$path"
 
   # cwd: prefer jsonl field, fall back to lossy decode of the parent dir.
@@ -261,10 +260,8 @@ cmd_preview() {
   last_at="$(_format_epoch "$mtime")"
 
   local title branch version cwd_in first_ts last_ts first_user last_user u_count a_count duration_secs
-  local first last
-  local -a lines=()
   _read_session_fields "$path"
-  first="$first_user"; last="$last_user"
+  local first="$first_user" last="$last_user"
 
   local cwd="$cwd_in"
   if [ -z "$cwd" ]; then
@@ -359,8 +356,12 @@ cmd_pick() {
   local reload_cmd="$self_q --all"
 
   # Tee the stream into a temp file so we can detect the empty-list case
-  # after fzf exits (fzf itself just shows an empty picker).
+  # after fzf exits (fzf itself just shows an empty picker). EXIT trap
+  # covers Ctrl-C and any other early termination.
   local tmpf; tmpf="$(mktemp)"
+  # Expand $tmpf now (double quotes), not at EXIT time when the local
+  # var is out of scope and would trip `set -u`.
+  trap "rm -f '$tmpf'" EXIT
   local selected
   selected="$(
     _pipeline \

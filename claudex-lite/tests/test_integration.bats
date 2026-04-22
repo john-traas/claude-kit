@@ -35,6 +35,26 @@ load test_helper
   [ "$cwd" = "$PROJ_ALPHA" ]
 }
 
+@test "pick: fzf receives --exact flag" {
+  local bin="$BATS_TMPDIR/cx-fzf-argv-$$-$RANDOM"
+  mkdir -p "$bin"
+  local argv_log="$bin/fzf.argv"
+  # Stub fzf: log argv, consume stdin silently (simulates user cancel
+  # so cmd_resume never runs).
+  cat > "$bin/fzf" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$argv_log"
+cat >/dev/null
+STUB
+  chmod +x "$bin/fzf"
+
+  cd "$PROJ_ALPHA"
+  run env PATH="$bin:$PATH" CX_LITE_SELF="$CX_LITE" "$CX_LITE"
+  [ "$status" -eq 0 ]
+  [ -f "$argv_log" ]
+  grep -q -- '--exact' "$argv_log"
+}
+
 @test "pick (no --all) from non-project cwd: warns, exits 0" {
   cd "$CX_TEST_ROOT"
   run bash -c "export CX_LITE_SELF='$CX_LITE'; '$CX_LITE' pick --print-first"

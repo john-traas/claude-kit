@@ -49,6 +49,23 @@ Inside the picker:
 | Ctrl-A | Broaden to all sessions |
 | Esc | Cancel |
 
+## Theming
+
+Set `CX_THEME` to one of:
+
+| Theme | Description |
+|---|---|
+| `default` | muted — dim time/repo, bold title, green branch |
+| `vivid` | higher contrast — cyan, yellow, magenta, green |
+| `mono` | no colour, for pipes or accessibility |
+
+```sh
+export CX_THEME=vivid      # persist in your shell rc
+CX_THEME=mono claudex-lite # one-shot
+```
+
+`NO_COLOR=1` forces `mono` regardless of `CX_THEME`.
+
 ## Optional: bind a key
 
 **zsh:**
