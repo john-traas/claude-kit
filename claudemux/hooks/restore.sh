@@ -24,7 +24,7 @@ while IFS=$'\t' read -r sess win pane cwd uuid; do
 
   # Guard against cwd drift — resume is cwd-scoped and fails silently otherwise.
   if [ "$actual_cwd" != "$cwd" ]; then
-    echo "claudemux: skipped ${target} (cwd drift: ${actual_cwd} != ${cwd})" >&2
+    tmux display-message "claudemux: skipped ${target} (cwd drift: ${actual_cwd} != ${cwd})"
     continue
   fi
 
