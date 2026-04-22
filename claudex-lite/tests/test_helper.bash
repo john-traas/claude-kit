@@ -24,6 +24,10 @@ setup() {
   export HOME="$CX_TEST_ROOT/home"
   mkdir -p "$HOME/.claude/projects"
 
+  # Isolate from any persisted user settings. Tests that exercise the
+  # configure path can point CX_CONFIG elsewhere inside the test.
+  export CX_CONFIG="$CX_TEST_ROOT/config/nonexistent"
+
   # Real project dirs under the test root; decoded cwds from fixtures
   # must match these so filter_cwd / resume work end-to-end.
   mkdir -p "$CX_TEST_ROOT/projects/alpha"

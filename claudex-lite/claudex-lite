@@ -3,6 +3,20 @@
 set -euo pipefail
 
 CX_PROJECTS_DIR="${CX_PROJECTS_DIR:-$HOME/.claude/projects}"
+CX_CONFIG="${CX_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claudex-lite/config}"
+
+# Config-file lines use `: "${VAR:=value}"`, so values set in the
+# environment win over anything persisted on disk.
+[ -f "$CX_CONFIG" ] && . "$CX_CONFIG"
+
+# Defaults for anything still unset after env + config.
+: "${CX_THEME:=default}"
+: "${CX_ROW_SHOW_REPO:=1}"
+: "${CX_ROW_SHOW_BRANCH:=1}"
+
+# Export so xargs workers and fzf's execute() children inherit the
+# same theme and column choices without re-reading the config file.
+export CX_THEME CX_ROW_SHOW_REPO CX_ROW_SHOW_BRANCH CX_CONFIG CX_PROJECTS_DIR
 
 usage() {
   cat <<EOF
@@ -15,8 +29,11 @@ Pick a Claude Code session from the current directory (or all directories
 with --all) and resume it. Requires: fzf, jq.
 
 Environment:
-  CX_THEME    default | vivid | mono     (default: default)
-  NO_COLOR    if set to anything, forces the mono theme
+  CX_THEME              default | vivid | mono     (default: default)
+  CX_ROW_SHOW_REPO      1 | 0 — show the [repo] column in rows
+  CX_ROW_SHOW_BRANCH    1 | 0 — show the ⎇ branch column in rows
+  CX_CONFIG             path to persisted config (default: XDG)
+  NO_COLOR              if set, forces the mono theme
 EOF
 }
 
@@ -219,8 +236,10 @@ extract_metadata() {
   [ "${#branch_short}" -gt 30 ] && branch_short="${branch_short:0:27}..."
 
   local row="${CX_C_TITLE}${label}${CX_C_RESET}"
-  [ -n "$repo"         ] && row="$row  ${CX_C_REPO}[$repo]${CX_C_RESET}"
-  [ -n "$branch_short" ] && row="$row  ${CX_C_BRANCH}⎇ $branch_short${CX_C_RESET}"
+  [ -n "$repo"         ] && [ "${CX_ROW_SHOW_REPO:-1}"   = "1" ] \
+    && row="$row  ${CX_C_REPO}[$repo]${CX_C_RESET}"
+  [ -n "$branch_short" ] && [ "${CX_ROW_SHOW_BRANCH:-1}" = "1" ] \
+    && row="$row  ${CX_C_BRANCH}⎇ $branch_short${CX_C_RESET}"
   # Strip control chars so an embedded tab/newline can't break the TSV.
   row="${row//$'\t'/ }"; row="${row//$'\n'/ }"; row="${row//$'\r'/ }"
 
@@ -328,6 +347,74 @@ scan_sessions() {
   discover_sessions | xargs -P 8 -I {} "$self" emit "{}"
 }
 
+# cmd_rows [--all]: emit the full pipeline (scan → optional cwd filter →
+# sort). Kept as its own subcommand so fzf's --bind=reload() has a
+# command to re-invoke after `configure`.
+cmd_rows() {
+  local all=0
+  [ "${1:-}" = "--all" ] && all=1
+  if [ "$all" -eq 1 ]; then
+    scan_sessions | sort_by_mtime
+  else
+    scan_sessions | filter_cwd "$(pwd -P)" | sort_by_mtime
+  fi
+}
+
+_yn() { [ "${1:-0}" = "1" ] && printf 'on' || printf 'off'; }
+
+_save_config() {
+  mkdir -p "$(dirname "$CX_CONFIG")"
+  cat > "$CX_CONFIG" <<EOF
+# Written by claudex-lite configure. The \${VAR:=value} form means an
+# environment override (e.g. NO_COLOR, CX_THEME) still wins over disk.
+: "\${CX_THEME:=$CX_THEME}"
+: "\${CX_ROW_SHOW_REPO:=$CX_ROW_SHOW_REPO}"
+: "\${CX_ROW_SHOW_BRANCH:=$CX_ROW_SHOW_BRANCH}"
+EOF
+}
+
+# cmd_configure: small fzf-driven menu to cycle the theme and toggle
+# the [repo] / ⎇ branch columns, persisting the choice to $CX_CONFIG.
+cmd_configure() {
+  check_deps fzf
+
+  while :; do
+    local choice
+    choice="$(
+      printf 'Theme: %s\nShow [repo] column: %s\nShow ⎇ branch column: %s\n[Save & exit]\n[Cancel]\n' \
+        "$CX_THEME" "$(_yn "$CX_ROW_SHOW_REPO")" "$(_yn "$CX_ROW_SHOW_BRANCH")" \
+      | fzf --prompt='claudex-lite configure > ' \
+            --no-sort --no-preview --height=12 \
+            --header='Enter to change / save / cancel  |  Esc to abandon'
+    )" || return 0
+
+    case "$choice" in
+      Theme:*)
+        case "$CX_THEME" in
+          default) CX_THEME=vivid   ;;
+          vivid)   CX_THEME=mono    ;;
+          *)       CX_THEME=default ;;
+        esac
+        _apply_theme
+        ;;
+      'Show [repo] column:'*)
+        CX_ROW_SHOW_REPO=$((1 - ${CX_ROW_SHOW_REPO:-1}))
+        ;;
+      'Show ⎇ branch column:'*)
+        CX_ROW_SHOW_BRANCH=$((1 - ${CX_ROW_SHOW_BRANCH:-1}))
+        ;;
+      '[Save & exit]')
+        _save_config
+        printf 'claudex-lite: saved %s\n' "$CX_CONFIG" >&2
+        return 0
+        ;;
+      '[Cancel]'|'')
+        return 0
+        ;;
+    esac
+  done
+}
+
 # cmd_pick: orchestrates discovery → filter → sort → fzf → emit choice.
 # Flags:
 #   --all           broaden to all sessions (not just cwd)
@@ -374,7 +461,10 @@ cmd_pick() {
   # Pass {5}=path and {1}=mtime straight through so cmd_preview can skip
   # the per-keystroke find+stat it would otherwise do.
   local preview_cmd="$self_q preview {5} {1}"
-  local reload_cmd="$self_q --all"
+  local scope_cmd="$self_q --all"
+  local configure_cmd="$self_q configure"
+  local rows_cmd="$self_q rows"
+  [ "$all" -eq 1 ] && rows_cmd="$rows_cmd --all"
 
   # Tee the stream into a temp file so we can detect the empty-list case
   # after fzf exits (fzf itself just shows an empty picker). EXIT trap
@@ -394,8 +484,9 @@ cmd_pick() {
           --with-nth=4 \
           --preview="$preview_cmd" \
           --preview-window=right:60% \
-          --bind="ctrl-a:execute($reload_cmd)+abort" \
-          --header='Enter: resume  |  Ctrl-A: all sessions  |  Esc: cancel' \
+          --bind="ctrl-a:execute($scope_cmd)+abort" \
+          --bind="ctrl-t:execute($configure_cmd)+reload($rows_cmd)" \
+          --header='Enter: resume  |  Ctrl-A: all sessions  |  Ctrl-T: configure  |  Esc: cancel' \
           || true
   )"
 
@@ -444,10 +535,12 @@ cmd_resume() {
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   case "${1:-pick}" in
     -h|--help) usage ;;
-    preview) shift; cmd_preview "$@" ;;
-    emit)    shift; extract_metadata "$@" ;;
-    resume)  shift; cmd_resume "$@" ;;
-    pick)    shift || true; cmd_pick "$@" ;;
+    preview)   shift; cmd_preview "$@" ;;
+    emit)      shift; extract_metadata "$@" ;;
+    resume)    shift; cmd_resume "$@" ;;
+    configure) shift; cmd_configure "$@" ;;
+    rows)      shift; cmd_rows "$@" ;;
+    pick)      shift || true; cmd_pick "$@" ;;
     --all|--print-first) cmd_pick "$@" ;;
     *) echo "claudex-lite: unknown command '$1'" >&2; usage >&2; exit 2 ;;
   esac

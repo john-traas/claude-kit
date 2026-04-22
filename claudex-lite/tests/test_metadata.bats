@@ -21,6 +21,35 @@ load test_helper
   [ "$emitted_path" = "$path" ]
 }
 
+@test "extract_metadata: CX_ROW_SHOW_REPO=0 hides the [repo] segment" {
+  enc="$(_th_encode_cwd "$PROJ_ALPHA")"
+  path="$HOME/.claude/projects/$enc/sess-001-normal.jsonl"
+  run env CX_ROW_SHOW_REPO=0 bash -c ". '$CX_LITE' && extract_metadata '$path'"
+  [ "$status" -eq 0 ]
+  IFS=$'\t' read -r _ _ _ row _ <<< "$output"
+  [[ "$row" != *"[alpha]"* ]]
+}
+
+@test "extract_metadata: CX_ROW_SHOW_BRANCH=0 hides the ⎇ segment" {
+  enc="$(_th_encode_cwd "$PROJ_REAL")"
+  path="$HOME/.claude/projects/$enc/sess-006-real.jsonl"
+  run env CX_ROW_SHOW_BRANCH=0 bash -c ". '$CX_LITE' && extract_metadata '$path'"
+  [ "$status" -eq 0 ]
+  IFS=$'\t' read -r _ _ _ row _ <<< "$output"
+  [[ "$row" != *"⎇"* ]]
+}
+
+@test "configure: _save_config writes env-override-friendly := form" {
+  local cfg="$CX_TEST_ROOT/cfg/claudex"
+  run env CX_CONFIG="$cfg" CX_THEME=vivid CX_ROW_SHOW_REPO=0 CX_ROW_SHOW_BRANCH=1 \
+    bash -c ". '$CX_LITE' && _save_config"
+  [ "$status" -eq 0 ]
+  [ -f "$cfg" ]
+  grep -q '\${CX_THEME:=vivid}'         "$cfg"
+  grep -q '\${CX_ROW_SHOW_REPO:=0}'     "$cfg"
+  grep -q '\${CX_ROW_SHOW_BRANCH:=1}'   "$cfg"
+}
+
 @test "extract_metadata: long branch names get truncated in the row" {
   enc="$(_th_encode_cwd "$PROJ_REAL")"
   path="$HOME/.claude/projects/$enc/sess-006-real.jsonl"

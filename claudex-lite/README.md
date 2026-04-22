@@ -44,27 +44,35 @@ Inside the picker:
 | Key | Action |
 |---|---|
 | Up / Down or Ctrl-P / Ctrl-N | Navigate |
-| Type | Fuzzy-filter |
+| Type | Substring-filter |
 | Enter | Resume the selected session |
 | Ctrl-A | Broaden to all sessions |
+| Ctrl-T | Open the configure menu |
 | Esc | Cancel |
 
-## Theming
+## Configure
 
-Set `CX_THEME` to one of:
+Press `Ctrl-T` in the picker (or run `claudex-lite configure`) to open
+a small menu for the theme and row columns. Choices persist to
+`${XDG_CONFIG_HOME:-~/.config}/claudex-lite/config`.
+
+Env vars override the config file, so one-shots still work:
+`CX_THEME=mono claudex-lite`.
+
+### Theme
 
 | Theme | Description |
 |---|---|
-| `default` | muted — dim time/repo, bold title, green branch |
+| `default` | muted — dim repo, bold title, green branch |
 | `vivid` | higher contrast — cyan, yellow, magenta, green |
 | `mono` | no colour, for pipes or accessibility |
 
-```sh
-export CX_THEME=vivid      # persist in your shell rc
-CX_THEME=mono claudex-lite # one-shot
-```
-
 `NO_COLOR=1` forces `mono` regardless of `CX_THEME`.
+
+### Row columns
+
+`CX_ROW_SHOW_REPO` and `CX_ROW_SHOW_BRANCH` (both default `1`) toggle
+the `[repo]` and `⎇ branch` segments in each row.
 
 ## Optional: bind a key
 
