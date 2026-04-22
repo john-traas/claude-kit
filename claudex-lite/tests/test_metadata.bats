@@ -5,7 +5,7 @@ load test_helper
   path="$HOME/.claude/projects/$enc/sess-001-normal.jsonl"
   run bash -c ". '$CX_LITE' && extract_metadata '$path'"
   [ "$status" -eq 0 ]
-  IFS=$'\t' read -r mtime uuid cwd row <<< "$output"
+  IFS=$'\t' read -r mtime uuid cwd row emitted_path <<< "$output"
   [[ "$mtime" =~ ^[0-9]+$ ]]
   [ "$uuid" = "sess-001-normal" ]
   [ "$cwd" = "$PROJ_ALPHA" ]
@@ -17,6 +17,8 @@ load test_helper
   [[ "$row" != *"⎇"* ]]
   # Row shows label/repo/branch only; timing lives in the preview.
   [[ "$row" != *"ago"* ]]
+  # Column 5 carries the absolute jsonl path for fzf's preview command.
+  [ "$emitted_path" = "$path" ]
 }
 
 @test "extract_metadata: long branch names get truncated in the row" {

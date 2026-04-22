@@ -7,8 +7,9 @@ CX_PROJECTS_DIR="${CX_PROJECTS_DIR:-$HOME/.claude/projects}"
 usage() {
   cat <<EOF
 Usage: claudex-lite [--all]
-       claudex-lite preview <uuid>
+       claudex-lite preview <uuid|path> [<mtime>]
        claudex-lite resume <uuid> <cwd>
+       claudex-lite configure
 
 Pick a Claude Code session from the current directory (or all directories
 with --all) and resume it. Requires: fzf, jq.
@@ -194,8 +195,9 @@ _format_epoch() {
 }
 
 # extract_metadata <absolute-path-to-jsonl>
-# Emits: mtime<TAB>uuid<TAB>cwd<TAB>display_row
-# display_row is the formatted line shown in the fzf picker.
+# Emits one TSV row: mtime<TAB>uuid<TAB>cwd<TAB>display_row<TAB>path
+# display_row is the label rendered in the fzf list; the trailing path
+# field lets cmd_preview skip a directory walk on each keystroke.
 extract_metadata() {
   local path="$1"
   local uuid="${path##*/}"; uuid="${uuid%.jsonl}"
@@ -255,6 +257,10 @@ find_session_path() {
   find "$CX_PROJECTS_DIR" -maxdepth 2 -type f -name "${uuid}.jsonl" 2>/dev/null | head -1
 }
 
+# cmd_preview <uuid|abs-path> [<mtime>]: render the rich detail panel.
+# Accepts either a bare uuid (tests, shell) or an absolute jsonl path
+# (fzf --preview, which can pass it via TSV column 5). When invoked
+# with mtime, avoids a stat fork.
 cmd_preview() {
   local arg="${1:-}"
   [ -n "$arg" ] || { echo "preview: missing uuid or path" >&2; exit 2; }
