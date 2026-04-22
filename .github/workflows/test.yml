@@ -1,0 +1,52 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  syntax:
+    name: shell syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n every tracked shell script
+        run: |
+          set -euo pipefail
+          # Parse-check every executable bash/sh file + the wrapper + hooks.
+          files=(
+            cx
+            claudemux/install.sh
+            claudemux/wrapper.sh
+            claudemux/hooks/_lib.sh
+            claudemux/hooks/save.sh
+            claudemux/hooks/restore.sh
+            claudex-lite/claudex-lite
+            claudex-lite/install.sh
+          )
+          for f in "${files[@]}"; do
+            echo "parse: $f"
+            bash -n "$f"
+          done
+
+  bats:
+    name: claudex-lite bats (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install deps (ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats jq fzf
+      - name: install deps (macos)
+        if: runner.os == 'macOS'
+        run: brew install bats-core jq fzf
+      - name: run bats
+        working-directory: claudex-lite
+        run: bats tests/
