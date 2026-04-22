@@ -549,9 +549,9 @@ _empty_msg() {
 _empty_hint() {
   local all="$1" target="$2"
   if [ "$all" -eq 0 ]; then
-    printf '⚠ No sessions in %s — press Ctrl-A for all sessions\n' "$target"
+    printf '⚠ No Claude sessions found in this folder — press Ctrl-A for all sessions\n'
   else
-    printf '⚠ No Claude sessions found — have you used Claude Code yet?\n'
+    printf '⚠ No Claude sessions found anywhere — have you used Claude Code yet?\n'
   fi
 }
 
