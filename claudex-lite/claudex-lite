@@ -159,6 +159,20 @@ _mtime() {
   stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
 }
 
+# _resolve_cwd_repo <path> <cwd_from_jsonl>: set caller locals `cwd`
+# and `repo`. Prefers the jsonl value, falls back to the lossy decode.
+_resolve_cwd_repo() {
+  local path="$1" cwd_in_val="$2"
+  if [ -n "$cwd_in_val" ]; then
+    cwd="$cwd_in_val"
+  else
+    local parent="${path%/*}"
+    cwd="$(decode_cwd "${parent##*/}")"
+  fi
+  repo=""
+  [ -n "$cwd" ] && repo="${cwd##*/}"
+}
+
 # format_duration <seconds>: short duration string. 5m / 3h 12m / 2d 4h.
 format_duration() {
   local s="$1"
@@ -190,17 +204,11 @@ extract_metadata() {
   local title branch version cwd_in first_ts last_ts first_user last_user u_count a_count duration_secs
   _read_session_fields "$path"
 
-  # cwd: prefer jsonl field, fall back to lossy decode of the parent dir.
-  local cwd="$cwd_in"
-  if [ -z "$cwd" ]; then
-    local parent="${path%/*}"
-    cwd="$(decode_cwd "${parent##*/}")"
-  fi
+  local cwd repo
+  _resolve_cwd_repo "$path" "$cwd_in"
 
   # Row label: custom title, else short UUID prefix.
   local label="${title:-${uuid:0:8}}"
-
-  local repo=""; [ -n "$cwd" ] && repo="${cwd##*/}"
 
   # Truncate title/branch so a pathological line can't blow out the
   # fzf pane width.
@@ -214,7 +222,9 @@ extract_metadata() {
   # Strip control chars so an embedded tab/newline can't break the TSV.
   row="${row//$'\t'/ }"; row="${row//$'\n'/ }"; row="${row//$'\r'/ }"
 
-  printf '%s\t%s\t%s\t%s\n' "$mtime" "$uuid" "$cwd" "$row"
+  # Field 5 (path) lets cmd_preview skip find_session_path + _mtime
+  # entirely when invoked via fzf's --preview.
+  printf '%s\t%s\t%s\t%s\t%s\n' "$mtime" "$uuid" "$cwd" "$row" "$path"
 }
 
 # realpath_safe <path>: best-effort realpath. Falls back to input when
@@ -246,30 +256,33 @@ find_session_path() {
 }
 
 cmd_preview() {
-  local uuid="${1:-}"
-  [ -n "$uuid" ] || { echo "preview: missing uuid" >&2; exit 2; }
+  local arg="${1:-}"
+  [ -n "$arg" ] || { echo "preview: missing uuid or path" >&2; exit 2; }
 
-  local path; path="$(find_session_path "$uuid")"
-  if [ -z "$path" ]; then
-    echo "preview: session $uuid not found" >&2
-    exit 1
+  # Accept either an absolute path (fzf preview, TSV col 5) or a uuid
+  # (tests, shell invocation).
+  local path uuid
+  if [ "${arg:0:1}" = "/" ]; then
+    path="$arg"
+  else
+    path="$(find_session_path "$arg")"
+    if [ -z "$path" ]; then
+      echo "preview: session $arg not found" >&2
+      exit 1
+    fi
   fi
+  uuid="${path##*/}"; uuid="${uuid%.jsonl}"
 
-  local mtime last_at
-  mtime="$(_mtime "$path")"
-  last_at="$(_format_epoch "$mtime")"
+  local mtime="${2:-}"
+  [ -n "$mtime" ] || mtime="$(_mtime "$path")"
+  local last_at; last_at="$(_format_epoch "$mtime")"
 
   local title branch version cwd_in first_ts last_ts first_user last_user u_count a_count duration_secs
   _read_session_fields "$path"
   local first="$first_user" last="$last_user"
 
-  local cwd="$cwd_in"
-  if [ -z "$cwd" ]; then
-    local parent="${path%/*}"
-    cwd="$(decode_cwd "${parent##*/}")"
-  fi
-
-  local repo=""; [ -n "$cwd" ] && repo="${cwd##*/}"
+  local cwd repo
+  _resolve_cwd_repo "$path" "$cwd_in"
 
   local started_at=""
   [ -n "$first_ts" ] && started_at="${first_ts:0:16}" && started_at="${started_at//T/ }"
@@ -352,7 +365,9 @@ cmd_pick() {
   # survive interpolation into fzf's execute() binding.
   local self="${CX_LITE_SELF:-$0}" self_q
   printf -v self_q '%q' "$self"
-  local preview_cmd="$self_q preview {2}"
+  # Pass {5}=path and {1}=mtime straight through so cmd_preview can skip
+  # the per-keystroke find+stat it would otherwise do.
+  local preview_cmd="$self_q preview {5} {1}"
   local reload_cmd="$self_q --all"
 
   # Tee the stream into a temp file so we can detect the empty-list case
