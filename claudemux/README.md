@@ -87,6 +87,70 @@ will mint a new UUID.
 - **Shell scope.** Only bash/zsh tested. Fish wrapper would need a
   translation of the function syntax.
 
+## Troubleshooting
+
+### `duplicate session: <name>` after `tmux kill-server`
+
+With `@continuum-restore 'on'`, starting the tmux server triggers a
+restore of the last saved snapshot — in parallel with your client's
+`tmux new -s <name>` command. If continuum recreates the session first,
+your `new -s` collides with it; if your command wins the race, continuum
+quietly merges windows into the session you just made. The outcome
+depends on snapshot iteration order and timing, not on which name you
+picked (`main` is not special).
+
+Preferred fix:
+
+- `tmux new -A -s <name>` — the `-A` flag means *attach if it exists,
+  create otherwise*, so either side of the race is fine.
+
+Other options:
+
+- `tmux attach -t <name>` — once you know continuum has restored it.
+- `tmux kill-session -t <name> && tmux new -s <name>` — deliberately
+  start fresh on that name (the server is already running at this
+  point, so no restore re-triggers).
+- Remove the snapshot: `rm ~/.tmux/resurrect/last` — nothing for continuum
+  to restore on next start.
+- Temporarily disable in `~/.tmux.conf`: `set -g @continuum-restore 'off'`
+  and `tmux source-file ~/.tmux.conf`.
+
+### Restore hook didn't re-resume Claude in a pane
+
+Usually one of the [known limitations](#known-limitations) — check that
+the pane's cwd matches the one recorded at save time, and that window/pane
+numbering hasn't shifted since the last save. Skipped panes log a message
+via `tmux display-message`; inspect with `tmux show-messages`.
+
+### Only some panes came back after relaunch
+
+Each iTerm pane (or terminal window) running `tmux` is a **separate tmux
+client**. Continuum restores server-side state — sessions, windows, panes,
+cwds — but client attachments die with the client, so every iTerm pane
+needs its own reattach after a server restart:
+
+```sh
+tmux new -A -s <session-name>    # or: tmux attach -t <session-name>
+```
+
+Once attached, claudemux's restore hook resumes claude in each tagged
+pane of that session. Multi-iTerm-pane setups work fine — you just have
+to run the attach command in each one.
+
+**Simplest topology for full auto-restore in one step:** run tmux in a
+single iTerm pane and use **tmux's own splits** (`Ctrl-B %` vertical,
+`Ctrl-B "` horizontal) for parallel work. A single `tmux new -A -s
+<name>` then brings the whole saved layout back.
+
+### If all else fails: find the session by hand
+
+When restore skips a pane or the UUID tag was lost, the conversation
+itself is still on disk under `~/.claude/projects/` — you just need to
+pick it and `claude --resume <uuid>` it manually. The easiest way is
+[claudex-lite](../claudex-lite/README.md), a sibling tool in claude-kit:
+an fzf picker that lists sessions in the current directory (or all
+projects with `--all`), shows a preview, and resumes the one you pick.
+
 ## Files
 
 | Path | Purpose |
@@ -191,9 +255,16 @@ message flashes at the bottom when it's done.
   a session UUID and starts Claude.
 - Manual save: `Ctrl-B Ctrl-S` (tmux-resurrect's default save binding).
 - Kill the server: `tmux kill-server`.
-- Relaunch: `tmux new -s main` — `@continuum-restore 'on'` brings the
-  saved layout back automatically; the claudemux restore hook fires
-  `claude --resume <uuid>` in each tagged pane.
+- Relaunch: `tmux new -A -s main`. The `-A` flag means *attach if the
+  session exists, create it otherwise* — exactly what you want when
+  `@continuum-restore 'on'` may or may not have recreated `main` already
+  by the time your command resolves. The act of starting the server
+  triggers continuum to rebuild the saved layout (sessions, windows,
+  panes, cwds), and the claudemux restore hook re-tags each saved pane
+  with its `@claude-session` UUID and sends `claude` into it — the
+  wrapper resolves to `--resume <uuid>`. Avoid bare `tmux new -s <name>`: whether
+  it works depends on a race with continuum's restore, so it sometimes
+  succeeds and sometimes errors `duplicate session`.
 
 ### 8. iTerm2 tips (optional but recommended)
 
