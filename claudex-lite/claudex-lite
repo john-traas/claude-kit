@@ -177,6 +177,31 @@ _mtime() {
   stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
 }
 
+# _assemble_row <label> <repo> <branch>: format a picker row using the
+# current theme and CX_ROW_SHOW_* toggles. Shared by extract_metadata
+# (real rows) and cmd_example_row (configure preview).
+_assemble_row() {
+  local label="$1" repo="$2" branch="$3"
+  local row="${CX_C_TITLE}${label}${CX_C_RESET}"
+  [ -n "$repo"   ] && [ "${CX_ROW_SHOW_REPO:-1}"   = "1" ] \
+    && row="$row  ${CX_C_REPO}[$repo]${CX_C_RESET}"
+  [ -n "$branch" ] && [ "${CX_ROW_SHOW_BRANCH:-1}" = "1" ] \
+    && row="$row  ${CX_C_BRANCH}⎇ $branch${CX_C_RESET}"
+  printf '%s' "$row"
+}
+
+# cmd_example_row: render a demo row for the configure menu's preview.
+cmd_example_row() {
+  printf '%sExample row%s — updates as you change settings\n\n  ' \
+    "$CX_C_LABEL" "$CX_C_RESET"
+  _assemble_row "lime-toolkit roadmap" "lime-toolkit" "main"
+  echo
+  echo
+  printf '  Theme:   %s%s%s\n' "$CX_C_TITLE" "$CX_THEME" "$CX_C_RESET"
+  printf '  Repo:    %s\n' "$(_yn "$CX_ROW_SHOW_REPO")"
+  printf '  Branch:  %s\n' "$(_yn "$CX_ROW_SHOW_BRANCH")"
+}
+
 # _resolve_cwd_repo <path> <cwd_from_jsonl>: set caller locals `cwd`
 # and `repo`. Prefers the jsonl value, falls back to the lossy decode.
 _resolve_cwd_repo() {
@@ -235,11 +260,7 @@ extract_metadata() {
   local branch_short="$branch"
   [ "${#branch_short}" -gt 30 ] && branch_short="${branch_short:0:27}..."
 
-  local row="${CX_C_TITLE}${label}${CX_C_RESET}"
-  [ -n "$repo"         ] && [ "${CX_ROW_SHOW_REPO:-1}"   = "1" ] \
-    && row="$row  ${CX_C_REPO}[$repo]${CX_C_RESET}"
-  [ -n "$branch_short" ] && [ "${CX_ROW_SHOW_BRANCH:-1}" = "1" ] \
-    && row="$row  ${CX_C_BRANCH}⎇ $branch_short${CX_C_RESET}"
+  local row; row="$(_assemble_row "$label" "$repo" "$branch_short")"
   # Strip control chars so an embedded tab/newline can't break the TSV.
   row="${row//$'\t'/ }"; row="${row//$'\n'/ }"; row="${row//$'\r'/ }"
 
@@ -378,13 +399,18 @@ EOF
 cmd_configure() {
   check_deps fzf
 
+  local self="${CX_LITE_SELF:-$0}" self_q
+  printf -v self_q '%q' "$self"
+
   while :; do
     local choice
     choice="$(
       printf 'Theme: %s\nShow [repo] column: %s\nShow ⎇ branch column: %s\n[Save & exit]\n[Cancel]\n' \
         "$CX_THEME" "$(_yn "$CX_ROW_SHOW_REPO")" "$(_yn "$CX_ROW_SHOW_BRANCH")" \
       | fzf --prompt='claudex-lite configure > ' \
-            --no-sort --no-preview --height=12 \
+            --ansi --no-sort --height=20 \
+            --preview="$self_q example-row" \
+            --preview-window=top:7 \
             --header='Enter to change / save / cancel  |  Esc to abandon'
     )" || return 0
 
@@ -538,8 +564,9 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     preview)   shift; cmd_preview "$@" ;;
     emit)      shift; extract_metadata "$@" ;;
     resume)    shift; cmd_resume "$@" ;;
-    configure) shift; cmd_configure "$@" ;;
-    rows)      shift; cmd_rows "$@" ;;
+    configure)   shift; cmd_configure "$@" ;;
+    rows)        shift; cmd_rows "$@" ;;
+    example-row) shift; cmd_example_row "$@" ;;
     pick)      shift || true; cmd_pick "$@" ;;
     --all|--print-first) cmd_pick "$@" ;;
     *) echo "claudex-lite: unknown command '$1'" >&2; usage >&2; exit 2 ;;
