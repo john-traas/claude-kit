@@ -10,9 +10,9 @@ Per-pane Claude Code session restore for tmux-resurrect. Each tmux pane
 survives save/restore cycles (and Claude Code updates) with its own
 session UUID intact.
 
-### [claudex-lite](claudex-lite/README.md)
+## Planned
 
-Fast, fzf-based picker for Claude Code sessions. Lists sessions from
-the current directory (or all projects with `--all`), shows a rich
-preview, and resumes the selected one. Ships with a `cx` dispatcher
-for shorter invocation.
+- **claudex** — an Ink-based session management workbench for Claude Code
+  sessions. Complements Claude Code's built-in resume picker with things it
+  deliberately doesn't do: rename, delete, tag, cross-session search, and
+  bulk operations. Not yet shipped.
