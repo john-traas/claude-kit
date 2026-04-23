@@ -1,0 +1,33 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  syntax:
+    name: shell syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n every tracked shell script
+        run: |
+          set -euo pipefail
+          # Parse-check every tracked shell file — any .sh or .bash, plus any
+          # executable tracked file with a shell shebang (catches extensionless
+          # scripts). Word boundaries via explicit delimiters (bash 3.2 compatible).
+          while IFS= read -r -d '' f; do
+            is_shell=0
+            case "$f" in
+              *.sh|*.bash) is_shell=1 ;;
+            esac
+            if [[ $is_shell -eq 0 && -x "$f" ]]; then
+              shebang=$(head -n 1 "$f" 2>/dev/null || true)
+              [[ "$shebang" =~ ^#![[:space:]]*(/[^[:space:]]*/)?(env[[:space:]]+)?(bash|sh)([[:space:]]|$) ]] && is_shell=1
+            fi
+            if [[ $is_shell -eq 1 ]]; then
+              echo "parse: $f"
+              bash -n "$f"
+            fi
+          done < <(git ls-files -z)
