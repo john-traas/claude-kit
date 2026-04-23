@@ -145,11 +145,13 @@ single iTerm pane and use **tmux's own splits** (`Ctrl-B %` vertical,
 ### If all else fails: find the session by hand
 
 When restore skips a pane or the UUID tag was lost, the conversation
-itself is still on disk under `~/.claude/projects/` — you just need to
-pick it and `claude --resume <uuid>` it manually. The easiest way is
-[claudex-lite](../claudex-lite/README.md), a sibling tool in claude-kit:
-an fzf picker that lists sessions in the current directory (or all
-projects with `--all`), shows a preview, and resumes the one you pick.
+itself is still on disk under `~/.claude/projects/`. Two ways to resume it:
+
+- **Claude Code's built-in session picker** (Claude Code 2.1+) lists
+  sessions with searchable previews, filterable by branch or worktree.
+- **Direct resume** — if you already know the UUID (e.g. from
+  `tmux show-options -pv @claude-session`), run `claude --resume <uuid>`
+  from the session's original cwd.
 
 ## Files
 
