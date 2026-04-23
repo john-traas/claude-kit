@@ -176,9 +176,9 @@ _read_session_fields() {
   done
 }
 
-# _mtime <path>: portable mtime in seconds since epoch (BSD + GNU).
+# _mtime <path>: portable mtime in seconds since epoch (GNU + BSD).
 _mtime() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
 }
 
 # _assemble_row <label> <repo> <branch>: format a picker row using the
