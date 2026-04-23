@@ -11,8 +11,9 @@ Dispatches to the Claude session picker:
   - Subcommand 'lite' or 'full' forces that tier.
   - Otherwise, 'claudex' (full) is used if installed; else 'claudex-lite'.
 
-Note: the 'full' tier ('claudex') is not yet shipped as of v0.1.0. The
-default and 'lite' subcommand both dispatch to 'claudex-lite'.
+Note: as of v0.1.0, this repo only ships the 'lite' tier ('claudex-lite').
+If you have installed 'claudex' separately, the default still prefers it;
+use the 'lite' subcommand to force 'claudex-lite'.
 
 All other arguments pass through to the chosen tier.
   cx --all        default tier, scope broadened to all sessions
